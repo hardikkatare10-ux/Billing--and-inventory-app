@@ -1,7 +1,7 @@
 
-  # Billing and Inventory App
+# Bill Pilot
 
-  This is a code bundle for Billing and Inventory App. The original project is available at https://www.figma.com/design/MdI9n8HrL1pdSlqcpCQnMH/Billing-and-Inventory-App.
+This is a code bundle for Bill Pilot. The original project is available at https://www.figma.com/design/MdI9n8HrL1pdSlqcpCQnMH/Billing-and-Inventory-App.
 
   ## Running the code
 

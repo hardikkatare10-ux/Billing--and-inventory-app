@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import AuthScreen from "./auth";
 import {
   LayoutDashboard, ShoppingCart, Package, FileText, QrCode,
   Building2, Users, Settings, User, Plus, Search, Bell,
@@ -10,6 +11,7 @@ import {
   Globe, Copy, Store, ChevronDown,
   Wallet, CreditCard, Gift, Award, Download
 } from "lucide-react";
+import { extractInvoiceFromFile, InvoiceExtractionResult } from "./invoiceParser";
 import {
   AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, PieChart, Pie, Cell
@@ -17,8 +19,12 @@ import {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 interface Profile {
-  shopName: string; ownerName: string; phone: string; email: string;
+  businessId: string; shopName: string; ownerName: string; phone: string; email: string;
   address: string; gst: string; pan: string; category: string; established: string;
+}
+interface BusinessAccount {
+  id: string; businessName: string; ownerName: string; mobile: string;
+  storageKey: string; createdAt: string; lastActiveAt: string;
 }
 interface AppSettings {
   defaultGst: string; taxMode: string; printHeader: boolean;
@@ -26,11 +32,43 @@ interface AppSettings {
 }
 interface Product {
   id: number; name: string; sku: string; barcode: string;
-  price: number; costPrice: number; stock: number; unit: string; category: string;
+  price: number; costPrice: number; retailPrice?: number; wholesalePrice?: number;
+  bulkThreshold?: number; stock: number; unit: string; category: string;
+  valuationMethod?: "fifo" | "lifo" | "weighted";
+}
+interface CustomerLedgerEntry {
+  id: string; date: string; type: "invoice" | "payment" | "adjustment"; amount: number; note: string;
 }
 interface Customer {
   id: number; name: string; phone: string; email: string;
   address: string; gst: string; totalSpent: number; lastPurchase: string;
+  creditLimit?: number; outstandingBalance?: number; preferredRate?: "retail" | "wholesale";
+  ledger?: CustomerLedgerEntry[];
+}
+interface UserAccount {
+  id: number; name: string; role: UserRole; phone: string; email: string; active: boolean;
+}
+type UserRole = "admin" | "manager" | "billing_staff" | "inventory_staff" | "readonly";
+interface AuthSessionUser {
+  username: string;
+  shopName: string;
+  phone: string;
+}
+interface RateRule {
+  id: number; customerId: number; productId: number; price: number; type: "retail" | "wholesale"; minQty: number;
+}
+interface PaymentReminder {
+  id: number; customerId: number; invoiceId?: string; dueAmount: number; dueDate: string;
+  status: "pending" | "sent" | "overdue"; channel: "whatsapp" | "sms"; createdAt: string;
+}
+interface EWayBill {
+  id: string; invoiceId?: string; customerId?: number; vehicleNumber: string;
+  fromGst: string; toGst: string; hsnCode: string; transportMode: string;
+  totalValue: number; taxableValue: number; driverName: string; generatedAt: string;
+  status: "generated" | "confirmed" | "cancelled"; rawData: string;
+}
+interface BackupRecord {
+  id: string; label: string; createdAt: string; data: string; source: string;
 }
 interface InvoiceItem { productId: number; name: string; qty: number; price: number; gstRate: number; }
 interface InvoiceRecord {
@@ -39,6 +77,7 @@ interface InvoiceRecord {
   due?: number;
   saleType?: "normal" | "cash";
   invoiceKind?: "tax" | "regular";
+  customerId?: number; paymentMethod?: string; outstanding?: number; items?: InvoiceItem[];
 }
 interface DemandOrder {
   id: number; customerName: string; items: string; date: string;
@@ -60,7 +99,7 @@ interface PPICard {
   rewardPoints: number; loyaltyTier: "bronze" | "silver" | "gold" | "platinum";
   transactions: PPITransaction[]; offers: PPIOffer[];
 }
-type Tab = "dashboard" | "demand" | "inventory" | "invoice" | "invoices" | "barcode" | "gst" | "customers" | "settings" | "profile" | "ppi";
+type Tab = "dashboard" | "demand" | "inventory" | "invoice" | "invoices" | "reminders" | "ewb" | "rates" | "bulk" | "backup" | "reports" | "sync" | "barcode" | "gst" | "customers" | "settings" | "profile" | "ppi";
 type InvoiceTemplate = "modern" | "classic" | "premium" | "official";
 
 const INVOICE_TEMPLATES: { id: InvoiceTemplate; label: string; desc: string }[] = [
@@ -71,8 +110,11 @@ const INVOICE_TEMPLATES: { id: InvoiceTemplate; label: string; desc: string }[] 
 ];
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
-const DEFAULT_PROFILE: Profile = { shopName: "", ownerName: "", phone: "", email: "", address: "", gst: "", pan: "", category: "Grocery & Provisions", established: String(new Date().getFullYear()) };
+const DEFAULT_PROFILE: Profile = { businessId: "", shopName: "", ownerName: "", phone: "", email: "", address: "", gst: "", pan: "", category: "Grocery & Provisions", established: String(new Date().getFullYear()) };
 const DEFAULT_SETTINGS: AppSettings = { defaultGst: "18", taxMode: "exclusive", printHeader: true, printFooter: true, autoWhatsApp: false };
+const ACCOUNT_INDEX_KEY = "billpro_business_accounts";
+const ACTIVE_ACCOUNT_KEY = "billpro_active_business_id";
+const LEGACY_KEYS = ["profile", "settings", "products", "customers", "demands", "invoices", "ppi_cards"];
 
 // ─── localStorage Hook ────────────────────────────────────────────────────────
 function useLocalStorage<T>(key: string, initial: T): [T, (v: T | ((p: T) => T)) => void] {
@@ -93,6 +135,58 @@ function useLocalStorage<T>(key: string, initial: T): [T, (v: T | ((p: T) => T))
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const fmt = (n: number) =>
   new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
+
+const normalizeLookup = (value: string) =>
+  value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+const normalizeScanCode = (value: string) =>
+  value
+    .trim()
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/^(?:barcode|bar\s*code|sku|item|code|qr)\s*[:#-]\s*/i, "")
+    .replace(/\s+/g, "");
+
+const roundMoney = (value: number) => Math.round(value * 100) / 100;
+
+const approxEqual = (a: number, b: number, tolerance = 0.08) =>
+  Math.abs(a - b) <= tolerance * Math.max(1, Math.abs(b));
+
+const normalizeMobile = (value: string) => value.replace(/\D/g, "").slice(-10);
+
+const businessSlug = (value: string) =>
+  value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "business";
+
+const makeBusinessId = (businessName: string, mobile: string, accounts: BusinessAccount[]) => {
+  const base = businessSlug(businessName);
+  const suffix = normalizeMobile(mobile).slice(-4) || String(Date.now()).slice(-4);
+  let id = `${base}-${suffix}`.toUpperCase();
+  let counter = 2;
+  while (accounts.some((a) => a.id === id)) id = `${base}-${suffix}-${counter++}`.toUpperCase();
+  return id;
+};
+
+const accountKey = (id: string) => `billpro_account_${id.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
+
+const readStored = <T,>(key: string, fallback: T): T => {
+  try {
+    const item = localStorage.getItem(key);
+    return item ? (JSON.parse(item) as T) : fallback;
+  } catch { return fallback; }
+};
+
+const writeStored = (key: string, value: unknown) => {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* noop */ }
+};
+
+const scopedStorageKey = (storageKey: string, key: string) => `${storageKey}_${key}`;
+
+function migrateLegacyData(storageKey: string) {
+  LEGACY_KEYS.forEach((key) => {
+    const legacyValue = localStorage.getItem(`billpro_${key}`);
+    const nextKey = scopedStorageKey(storageKey, key);
+    if (legacyValue && !localStorage.getItem(nextKey)) localStorage.setItem(nextKey, legacyValue);
+  });
+}
 
 function EmptyState({ icon: Icon, title, desc, action }: { icon: React.ElementType; title: string; desc: string; action?: React.ReactNode }) {
   return (
@@ -162,12 +256,32 @@ const StatusBadge = ({ status }: { status: DemandOrder["status"] }) => {
   );
 };
 
-// ─── Setup / Onboarding ───────────────────────────────────────────────────────
-function SetupScreen({ onComplete }: { onComplete: (p: Profile) => void }) {
+// ─── Setup / Account Access ───────────────────────────────────────────────────
+function AccountAccessScreen({ accounts, onRegister, onActivate }: {
+  accounts: BusinessAccount[];
+  onRegister: (p: Profile) => void;
+  onActivate: (account: BusinessAccount) => void;
+}) {
   const [step, setStep] = useState(1);
   const [form, setForm] = useState(DEFAULT_PROFILE);
+  const [login, setLogin] = useState("");
+  const [loginError, setLoginError] = useState("");
   const set = (k: keyof Profile, v: string) => setForm((f) => ({ ...f, [k]: v }));
-  const canNext = form.shopName.trim() && form.ownerName.trim() && form.phone.trim();
+  const canNext = form.shopName.trim() && form.ownerName.trim() && normalizeMobile(form.phone).length === 10;
+  const activateAccount = () => {
+    const query = login.trim().toLowerCase();
+    const mobile = normalizeMobile(login);
+    const matches = accounts.filter((a) =>
+      a.id.toLowerCase() === query ||
+      a.mobile === mobile ||
+      a.businessName.toLowerCase() === query
+    );
+    if (matches.length === 1) {
+      onActivate(matches[0]);
+      return;
+    }
+    setLoginError(matches.length > 1 ? "More than one business has this name. Use mobile number or business ID." : "No saved business found for this ID or mobile number.");
+  };
   return (
     <div className="min-h-screen bg-[#0f2557] flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
@@ -175,10 +289,10 @@ function SetupScreen({ onComplete }: { onComplete: (p: Profile) => void }) {
           <div className="w-16 h-16 rounded-2xl bg-[#f59e0b] flex items-center justify-center mx-auto mb-4 shadow-lg">
             <Store className="w-8 h-8 text-white" />
           </div>
-          <h1 className="text-2xl font-bold">Welcome to BillPro</h1>
-          <p className="text-blue-200 text-sm mt-1">Set up your shop to get started</p>
+          <h1 className="text-2xl font-bold">Welcome to Bill Pilot</h1>
+          <p className="text-blue-200 text-sm mt-1">Open your business dataset from this device</p>
           <div className="flex items-center gap-2 justify-center mt-4">
-            {[1, 2].map((s) => (
+            {[1, 2, 3].map((s) => (
               <div key={s} className={`h-1.5 rounded-full transition-all ${step >= s ? "bg-[#f59e0b] w-8" : "bg-white/20 w-4"}`} />
             ))}
           </div>
@@ -186,6 +300,36 @@ function SetupScreen({ onComplete }: { onComplete: (p: Profile) => void }) {
 
         <div className="p-7 space-y-4">
           {step === 1 ? (
+            <>
+              <h2 className="font-semibold text-foreground text-lg">Login with Business ID or Mobile</h2>
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1">Business ID / Mobile Number</label>
+                <input value={login} onChange={(e) => { setLogin(e.target.value); setLoginError(""); }} placeholder="e.g. SHARMA-GENERAL-1234 or mobile"
+                  className="w-full px-3.5 py-2.5 bg-background border border-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" />
+              </div>
+              {loginError && <p className="text-xs text-red-600">{loginError}</p>}
+              <button disabled={!login.trim()} onClick={activateAccount}
+                className="w-full py-3 bg-primary text-primary-foreground rounded-xl font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                Activate Account
+              </button>
+              <button onClick={() => setStep(2)} className="w-full py-2.5 border border-border rounded-xl text-sm text-muted-foreground hover:bg-muted transition-colors">
+                Create New Business ID
+              </button>
+              {accounts.length > 0 && (
+                <div className="pt-2 border-t border-border/70">
+                  <p className="text-xs font-medium text-muted-foreground mb-2">Saved businesses on this device</p>
+                  <div className="space-y-2 max-h-32 overflow-y-auto">
+                    {accounts.map((account) => (
+                      <button key={account.id} onClick={() => onActivate(account)} className="w-full text-left p-2.5 rounded-lg bg-muted/60 hover:bg-muted transition-colors">
+                        <p className="text-sm font-medium text-foreground">{account.businessName}</p>
+                        <p className="text-[11px] text-muted-foreground font-[DM_Mono]">{account.id} · {account.mobile}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : step === 2 ? (
             <>
               <h2 className="font-semibold text-foreground text-lg">Shop Information</h2>
               {[
@@ -199,7 +343,7 @@ function SetupScreen({ onComplete }: { onComplete: (p: Profile) => void }) {
                     className="w-full px-3.5 py-2.5 bg-background border border-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" />
                 </div>
               ))}
-              <button disabled={!canNext} onClick={() => setStep(2)}
+              <button disabled={!canNext} onClick={() => setStep(3)}
                 className="w-full py-3 bg-primary text-primary-foreground rounded-xl font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-40 disabled:cursor-not-allowed mt-2">
                 Continue →
               </button>
@@ -227,9 +371,9 @@ function SetupScreen({ onComplete }: { onComplete: (p: Profile) => void }) {
                 </select>
               </div>
               <div className="flex gap-3 pt-1">
-                <button onClick={() => setStep(1)} className="flex-1 py-3 border border-border rounded-xl text-sm text-muted-foreground hover:bg-muted transition-colors">← Back</button>
-                <button onClick={() => onComplete(form)} className="flex-1 py-3 bg-primary text-primary-foreground rounded-xl font-medium text-sm hover:bg-primary/90 transition-colors">
-                  Launch App 🚀
+                <button onClick={() => setStep(2)} className="flex-1 py-3 border border-border rounded-xl text-sm text-muted-foreground hover:bg-muted transition-colors">← Back</button>
+                <button onClick={() => onRegister(form)} className="flex-1 py-3 bg-primary text-primary-foreground rounded-xl font-medium text-sm hover:bg-primary/90 transition-colors">
+                  Launch App
                 </button>
               </div>
             </>
@@ -484,9 +628,11 @@ function InventoryView({ products, setProducts }: { products: Product[]; setProd
   const [search, setSearch] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState<number | null>(null);
-  const [billText, setBillText] = useState("");
-  const [billImportNote, setBillImportNote] = useState("");
-  const [ocrProcessing, setOcrProcessing] = useState(false);
+  const [invoiceFile, setInvoiceFile] = useState<File | null>(null);
+  const [invoiceResult, setInvoiceResult] = useState<InvoiceExtractionResult | null>(null);
+  const [invoiceProcessing, setInvoiceProcessing] = useState(false);
+  const [invoiceMessage, setInvoiceMessage] = useState("");
+  const [invoiceMargin, setInvoiceMargin] = useState("25");
   const [form, setForm] = useState({ name: "", sku: "", barcode: "", price: "", costPrice: "", stock: "", unit: "Packet", category: "Grocery & Provisions" });
   const filtered = products.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()) || p.sku.toLowerCase().includes(search.toLowerCase()));
   const lowStock = products.filter((p) => p.stock <= 10).length;
@@ -494,86 +640,74 @@ function InventoryView({ products, setProducts }: { products: Product[]; setProd
   const openAdd = () => { setForm({ name: "", sku: "", barcode: "", price: "", costPrice: "", stock: "", unit: "Packet", category: "Grocery & Provisions" }); setEditId(null); setShowForm(true); };
   const openEdit = (p: Product) => { setForm({ name: p.name, sku: p.sku, barcode: p.barcode, price: String(p.price), costPrice: String(p.costPrice), stock: String(p.stock), unit: p.unit, category: p.category }); setEditId(p.id); setShowForm(true); };
 
-  const parseBillLines = (text: string) => {
-    return text.split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const clean = line.replace(/₹/g, "").replace(/[\t,]+/g, " ").replace(/[^0-9.\sA-Za-z]/g, " ");
-        const parts = clean.split(" ").filter(Boolean);
-        const numbers = parts.filter((p) => /^\d+(?:\.\d+)?$/.test(p)).map(Number);
-        const name = parts.filter((p) => !/^\d+(?:\.\d+)?$/.test(p)).join(" ").trim() || "Unknown item";
-        let qty = 1;
-        let price = 0;
-        if (numbers.length >= 2) {
-          qty = numbers[numbers.length - 2];
-          price = numbers[numbers.length - 1];
-        } else if (numbers.length === 1) {
-          price = numbers[0];
-        }
-        return { name, qty: Math.max(1, qty), price: Math.max(0, price) };
-      })
-      .filter((entry) => entry.name && entry.price >= 0 && entry.qty > 0);
+  const processInvoiceFile = async () => {
+    if (!invoiceFile) return;
+    setInvoiceProcessing(true);
+    setInvoiceMessage("Detecting invoice region and extracting text...");
+    try {
+      const result = await extractInvoiceFromFile(invoiceFile, setInvoiceMessage);
+      setInvoiceResult(result);
+      setInvoiceMessage(`Invoice extraction complete. Found ${result.items.length} item(s).`);
+    } catch (error) {
+      setInvoiceResult(null);
+      setInvoiceMessage(`Invoice OCR failed: ${String(error)}`);
+    } finally {
+      setInvoiceProcessing(false);
+    }
   };
 
-  // Helper to load external scripts dynamically (CDN fallback)
-  const loadScript = (src: string) => new Promise<void>((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) return resolve();
-    const s = document.createElement('script');
-    s.src = src;
-    s.async = true;
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error(`Failed to load ${src}`));
-    document.head.appendChild(s);
-  });
-
-  const ensureTesseract = async () => {
-    // @ts-ignore
-    if ((window as any).Tesseract) return (window as any).Tesseract;
-    // use CDN build
-    await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@4.0.2/dist/tesseract.min.js');
-    // @ts-ignore
-    return (window as any).Tesseract;
-  };
-
-  const ensurePdfJs = async () => {
-    // @ts-ignore
-    const win = window as any;
-    if (win.pdfjsLib) return win.pdfjsLib;
-    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js');
-    // @ts-ignore
-    const pdfjs = win.pdfjsLib || win.pdfjs;
-    if (pdfjs && pdfjs.GlobalWorkerOptions) pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
-    return pdfjs;
-  };
-
-  const importBillInventory = () => {
-    const entries = parseBillLines(billText);
-    if (!entries.length) {
-      setBillImportNote("No valid bill lines found. Use one item per line like 'Sugar 10 150'.");
+  const importInvoiceItems = () => {
+    if (!invoiceResult?.items.length) {
+      setInvoiceMessage("No invoice items to import. Process an invoice first.");
       return;
     }
-
+    const marginPct = Number.isFinite(Number(invoiceMargin)) ? Math.max(0, Number(invoiceMargin)) : 0;
+    const salePriceFor = (costPrice: number) => costPrice > 0 ? roundMoney(costPrice * (1 + marginPct / 100)) : 0;
     let added = 0;
     let updated = 0;
+    let skipped = 0;
     setProducts((prev) => {
       const next = [...prev];
-      entries.forEach((entry) => {
-        const existing = next.find((p) => p.name.toLowerCase() === entry.name.toLowerCase());
+      invoiceResult.items.forEach((item) => {
+        const name = item.item_name?.trim();
+        if (!name) { skipped++; return; }
+        const quantity = item.quantity ? Math.max(1, Math.round(Number(item.quantity))) : 1;
+        const costPrice = item.rate ? Number(item.rate) : item.amount ? roundMoney(Number(item.amount) / Math.max(1, quantity)) : 0;
+        const existing = next.find((p) => normalizeLookup(p.name) === normalizeLookup(name));
         if (existing) {
-          existing.stock += entry.qty;
-          existing.price = entry.price || existing.price;
+          existing.stock += quantity;
+          if (costPrice > 0) {
+            existing.costPrice = costPrice;
+            existing.price = salePriceFor(costPrice);
+          }
           updated += 1;
         } else {
           const id = Date.now() + Math.floor(Math.random() * 1000);
-          next.push({ id, name: entry.name, sku: `SKU-${id}`, barcode: `BRC${id}`, price: entry.price, costPrice: entry.price, stock: entry.qty, unit: "Piece", category: "Other" });
+          next.push({ id, name, sku: `SKU-${id}`, barcode: "", price: salePriceFor(costPrice), costPrice, stock: quantity, unit: "Piece", category: "Grocery & Provisions" });
           added += 1;
         }
       });
       return next;
     });
-    setBillText("");
-    setBillImportNote(`Imported ${entries.length} bill line(s): ${added} new product(s), ${updated} updated.`);
+    setInvoiceMessage(`Imported ${added + updated} item(s): ${added} new, ${updated} updated${skipped ? `, ${skipped} skipped (no name detected)` : ""}. Sale prices use ${invoiceMargin}% margin.`);
+  };
+
+  const clearInvoiceImport = () => {
+    setInvoiceFile(null);
+    setInvoiceResult(null);
+    setInvoiceMessage("");
+  };
+
+  const emptyInventory = () => {
+    if (!products.length) {
+      setInvoiceMessage("Inventory is already empty.");
+      return;
+    }
+    if (window.confirm(`Empty inventory and delete all ${products.length} product(s)? This cannot be undone.`)) {
+      setProducts([]);
+      setSearch("");
+      setInvoiceMessage("Inventory emptied.");
+    }
   };
 
   const handleSave = () => {
@@ -594,92 +728,90 @@ function InventoryView({ products, setProducts }: { products: Product[]; setProd
           <AlertTriangle className="w-4 h-4 shrink-0" /><span><strong>{lowStock} product{lowStock > 1 ? "s" : ""}</strong> running low on stock.</span>
         </div>
       )}
-      <div className="flex gap-3">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="flex-1 relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search products..."
             className="w-full pl-9 pr-4 py-2.5 bg-card border border-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" />
         </div>
-        <button onClick={openAdd} className="flex items-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground rounded-xl text-sm font-medium hover:bg-primary/90 transition-colors shadow-sm">
-          <Plus className="w-4 h-4" /> Add Product
-        </button>
+        <div className="flex flex-wrap gap-2 justify-end">
+          <button onClick={openAdd} className="flex items-center gap-2 px-4 py-2.5 bg-primary text-primary-foreground rounded-xl text-sm font-medium hover:bg-primary/90 transition-colors shadow-sm">
+            <Plus className="w-4 h-4" /> Add Product
+          </button>
+          <button onClick={emptyInventory} className="flex items-center gap-2 px-4 py-2.5 bg-red-600 text-white rounded-xl text-sm font-medium hover:bg-red-700 transition-colors shadow-sm">
+            <RotateCcw className="w-4 h-4" /> Empty Inventory
+          </button>
+        </div>
       </div>
 
       <div className="bg-card rounded-xl p-5 border border-border shadow-sm space-y-3">
         <div className="flex items-center justify-between">
           <div>
-            <h3 className="font-semibold text-foreground">Import from Printed Bill</h3>
-            <p className="text-xs text-muted-foreground">Paste handwritten or printed bill lines to populate inventory.</p>
+            <h3 className="font-semibold text-foreground">Invoice OCR & Import</h3>
+            <p className="text-xs text-muted-foreground">Upload an invoice image or PDF, extract structured data and import invoice items into inventory.</p>
           </div>
-          <span className="text-xs text-muted-foreground">One item per line</span>
+          <span className="text-xs text-muted-foreground">Confidence threshold 80%</span>
         </div>
-        <div className="space-y-2">
-          <div>
-            <label className="block text-xs font-medium text-muted-foreground mb-1">Upload bill photo / PDF</label>
-            <input type="file" accept="image/*,.pdf" onChange={async (e) => {
-              const f = e.target.files?.[0];
-              if (!f) return;
-              setBillImportNote("Starting OCR...");
-              setOcrProcessing(true);
-              try {
-                let fullText = '';
-                const T = await ensureTesseract();
-                // create worker via global Tesseract
-                // @ts-ignore
-                const worker = await T.createWorker({ logger: (m: any) => setBillImportNote(`${m.status} ${Math.round((m.progress||0)*100)}%`) });
-                await worker.load();
-                await worker.loadLanguage('eng');
-                await worker.initialize('eng');
-
-                if (f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')) {
-                  try {
-                    const pdfjs = await ensurePdfJs();
-                    const loading = pdfjs.getDocument({ url: URL.createObjectURL(f) });
-                    const doc = await loading.promise;
-                    for (let p = 1; p <= doc.numPages; p++) {
-                      const page = await doc.getPage(p);
-                      const viewport = page.getViewport({ scale: 2 });
-                      const canvas = document.createElement('canvas');
-                      canvas.width = Math.floor(viewport.width);
-                      canvas.height = Math.floor(viewport.height);
-                      const ctx = canvas.getContext('2d')!;
-                      await page.render({ canvasContext: ctx, viewport }).promise;
-                      // @ts-ignore
-                      const { data: { text } } = await worker.recognize(canvas);
-                      fullText += text + '\n';
-                    }
-                  } catch (err) {
-                    setBillImportNote('PDF OCR failed. Try uploading images or install pdfjs-dist.');
-                  }
-                } else {
-                  // image file
-                  // @ts-ignore
-                  const { data: { text } } = await worker.recognize(f);
-                  fullText = text;
-                }
-
-                await worker.terminate();
-                if (fullText) {
-                  setBillText((s) => (s ? s + '\n' + fullText : fullText));
-                  setBillImportNote('OCR complete — review/edit the extracted lines, then click Import.');
-                }
-              } catch (error) {
-                setBillImportNote('OCR error. Try installing tesseract.js or use an image file.');
-              } finally {
-                setOcrProcessing(false);
-              }
-            }} className="w-full text-xs" />
-            {ocrProcessing && <p className="text-xs text-muted-foreground mt-1">Running OCR... please wait.</p>}
+        <div className="grid gap-4 lg:grid-cols-[1fr_auto]">
+          <div className="space-y-3">
+            <div>
+              <label className="block text-xs font-medium text-muted-foreground mb-1">Upload invoice image or PDF</label>
+              <input type="file" accept="image/*,.pdf" onChange={(e) => setInvoiceFile(e.target.files?.[0] || null)} className="w-full text-xs" />
+            </div>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <button onClick={processInvoiceFile} disabled={!invoiceFile || invoiceProcessing} className="flex-1 px-4 py-2 rounded-xl bg-slate-900 text-white text-sm font-medium hover:bg-slate-950 transition-colors disabled:opacity-50">Process Invoice</button>
+              <button onClick={clearInvoiceImport} className="flex-1 px-4 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:bg-muted transition-colors">Clear</button>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-medium text-muted-foreground mb-1">Import margin %</label>
+                <input type="number" min="0" value={invoiceMargin} onChange={(e) => setInvoiceMargin(e.target.value)} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" />
+              </div>
+              <div className="flex items-end">
+                <button onClick={importInvoiceItems} disabled={!invoiceResult?.items.length || invoiceProcessing} className="w-full px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors disabled:opacity-50">Import Items</button>
+              </div>
+            </div>
+            {invoiceMessage && <p className="text-xs text-muted-foreground">{invoiceMessage}</p>}
           </div>
+          {invoiceResult && (
+            <div className="rounded-2xl border border-border bg-background p-3 text-sm space-y-3">
+              <div className="flex flex-wrap gap-2">
+                <span className="text-xs font-semibold text-slate-600">Invoice</span>
+                <span className="text-xs text-foreground">{invoiceResult.invoice_number || "#unknown"}</span>
+                <span className="text-xs text-foreground">{invoiceResult.date || "No date"}</span>
+                <span className="text-xs text-foreground">{invoiceResult.customer_name || "No customer"}</span>
+                <span className="text-xs text-muted-foreground">Confidence {invoiceResult.confidence}%</span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-xs text-slate-700">
+                <div><strong>Subtotal:</strong> {invoiceResult.subtotal || "-"}</div>
+                <div><strong>Total:</strong> {invoiceResult.grand_total || "-"}</div>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-border/70 text-left text-xs uppercase tracking-wide text-muted-foreground">
+                      <th className="px-3 py-2">Item</th>
+                      <th className="px-3 py-2">Qty</th>
+                      <th className="px-3 py-2">Rate</th>
+                      <th className="px-3 py-2">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {invoiceResult.items.map((item, idx) => (
+                      <tr key={`${item.item_name ?? "item"}-${idx}`} className="border-b border-border/50 even:bg-muted/50">
+                        <td className="px-3 py-2 font-medium text-foreground">{item.item_name || "-"}</td>
+                        <td className="px-3 py-2 text-muted-foreground">{item.quantity || "-"}</td>
+                        <td className="px-3 py-2 text-muted-foreground">{item.rate || "-"}</td>
+                        <td className="px-3 py-2 text-muted-foreground">{item.amount || "-"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <textarea readOnly rows={6} value={invoiceResult.raw_text} className="w-full px-3 py-2 bg-background border border-border rounded-xl text-xs font-[DM_Mono] focus:outline-none" />
+            </div>
+          )}
         </div>
-        <textarea value={billText} onChange={(e) => setBillText(e.target.value)} rows={5}
-          placeholder="Example:\nSugar 10 150\nMilk 2 50\nOil 1 220"
-          className="w-full px-3 py-2 bg-background border border-border rounded-xl text-sm font-[DM_Mono] focus:outline-none focus:ring-2 focus:ring-primary/30" />
-        <div className="flex flex-col sm:flex-row gap-2">
-          <button onClick={importBillInventory} className="flex-1 px-4 py-2 rounded-xl bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors">Import Bill Items</button>
-          <button onClick={() => { setBillText(""); setBillImportNote(""); }} className="flex-1 px-4 py-2 rounded-xl border border-border text-sm text-muted-foreground hover:bg-muted transition-colors">Clear</button>
-        </div>
-        {billImportNote && <p className="text-xs text-muted-foreground">{billImportNote}</p>}
       </div>
 
       {showForm && (
@@ -781,12 +913,16 @@ function InvoiceView({ products, customers, profile, settings, onSave, onNavigat
     setItems((prev) => prev.map((it, i) => i === idx ? { ...it, [field]: value } : it));
 
   const handleScanCode = (code: string) => {
-    const trimmed = code.trim();
+    const trimmed = normalizeScanCode(code);
     if (!trimmed) {
       setScanMessage("");
       return;
     }
-    const product = products.find((p) => p.barcode === trimmed || p.sku === trimmed || p.name.toLowerCase() === trimmed.toLowerCase());
+    const product = products.find((p) =>
+      normalizeScanCode(p.barcode) === trimmed ||
+      normalizeScanCode(p.sku) === trimmed ||
+      normalizeLookup(p.name) === normalizeLookup(trimmed)
+    );
     if (!product) {
       setScanMessage("No matching registered product found for this QR/barcode.");
       return;
@@ -795,6 +931,10 @@ function InvoiceView({ products, customers, profile, settings, onSave, onNavigat
       const existing = prev.find((it) => it.productId === product.id);
       if (existing) {
         return prev.map((it) => it.productId === product.id ? { ...it, qty: it.qty + 1, price: product.price, name: product.name } : it);
+      }
+      const emptyIndex = prev.findIndex((it) => !it.productId && !it.name.trim() && it.price === 0);
+      if (emptyIndex >= 0) {
+        return prev.map((it, i) => i === emptyIndex ? { productId: product.id, name: product.name, qty: 1, price: product.price, gstRate: Number(settings.defaultGst) } : it);
       }
       return [...prev, { productId: product.id, name: product.name, qty: 1, price: product.price, gstRate: Number(settings.defaultGst) }];
     });
@@ -1684,6 +1824,10 @@ function SettingsView({ settings, setSettings, profile, setProfile }: {
     <div className="space-y-4 max-w-3xl">
       <div className="bg-card rounded-xl p-5 border border-border shadow-sm space-y-4">
         <h3 className="font-semibold text-foreground">Business Information</h3>
+        <div className="p-3 rounded-lg bg-muted/60 border border-border/70">
+          <p className="text-xs font-medium text-muted-foreground mb-1">Business ID</p>
+          <p className="text-sm font-[DM_Mono] text-foreground">{profile.businessId || "Not assigned"}</p>
+        </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {([["Shop / Business Name", "shopName"], ["Owner Name", "ownerName"], ["Phone / WhatsApp", "phone"], ["Email", "email"], ["GST Number", "gst"], ["PAN Number", "pan"]] as [string, keyof Profile][]).map(([label, key]) => (
             <div key={key}>
@@ -1773,14 +1917,14 @@ function ProfileView({ profile, setProfile, invoices, products, customers }: {
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {([["Shop Name", "shopName"], ["Owner Name", "ownerName"], ["Phone", "phone"], ["Email", "email"], ["GST Number", "gst"], ["PAN Number", "pan"], ["Category", "category"], ["Established", "established"]] as [string, keyof Profile][]).map(([label, key]) => (
+          {([["Business ID", "businessId"], ["Shop Name", "shopName"], ["Owner Name", "ownerName"], ["Phone", "phone"], ["Email", "email"], ["GST Number", "gst"], ["PAN Number", "pan"], ["Category", "category"], ["Established", "established"]] as [string, keyof Profile][]).map(([label, key]) => (
             <div key={key}>
               <label className="block text-xs font-medium text-muted-foreground mb-1">{label}</label>
-              {editing ? (
+              {editing && key !== "businessId" ? (
                 <input value={local[key]} onChange={(e) => setLocal((p) => ({ ...p, [key]: e.target.value }))}
                   className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" />
               ) : (
-                <p className="text-sm text-foreground">{profile[key] || <span className="text-muted-foreground italic">Not set</span>}</p>
+                <p className={`text-sm text-foreground ${key === "businessId" ? "font-[DM_Mono]" : ""}`}>{profile[key] || <span className="text-muted-foreground italic">Not set</span>}</p>
               )}
             </div>
           ))}
@@ -1930,7 +2074,7 @@ function ClosedPPIView({ cards, setCards, profile }: {
     <h2>Transaction Statement</h2><p>Card: <span class="mono">${c.cardId}</span> | Customer: ${c.customerName} | Balance: ₹${c.balance.toLocaleString("en-IN")}</p>
     <table><thead><tr><th>Date</th><th>Bill No.</th><th>Type</th><th>Amount</th><th>Balance</th><th>Method</th><th>Staff</th></tr></thead><tbody>
     ${c.transactions.map(t => `<tr><td>${t.date}</td><td class="mono">${t.billNumber}</td><td>${t.type}</td><td>₹${Math.abs(t.amount).toLocaleString("en-IN")}</td><td>₹${t.remainingBalance.toLocaleString("en-IN")}</td><td>${t.paymentMethod}</td><td>${t.staffName}</td></tr>`).join("")}
-    </tbody></table><p style="margin-top:16px;font-size:11px;color:#64748b">Generated by BillPro — ${new Date().toLocaleString("en-IN")}</p></body></html>`);
+    </tbody></table><p style="margin-top:16px;font-size:11px;color:#64748b">Generated by Bill Pilot — ${new Date().toLocaleString("en-IN")}</p></body></html>`);
     win.document.close(); setTimeout(() => win.print(), 400);
   };
 
@@ -2373,6 +2517,13 @@ const NAV: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: "inventory", label: "Inventory", icon: Package },
   { id: "invoice", label: "Invoice", icon: FileText },
   { id: "invoices", label: "Invoices", icon: FileText },
+  { id: "reminders", label: "Reminders", icon: Bell },
+  { id: "ewb", label: "E-Way Bill", icon: CreditCard },
+  { id: "rates", label: "Party Rates", icon: Tag },
+  { id: "bulk", label: "Bulk Update", icon: Download },
+  { id: "backup", label: "Backup", icon: HardDrive },
+  { id: "reports", label: "Reports", icon: TrendingUp },
+  { id: "sync", label: "Sync", icon: Globe },
   { id: "barcode", label: "Barcode", icon: QrCode },
   { id: "ppi", label: "Closed PPI", icon: Wallet },
   { id: "gst", label: "GST / ITR", icon: Building2 },
@@ -2383,24 +2534,198 @@ const NAV: { id: Tab; label: string; icon: React.ElementType }[] = [
 
 const TITLES: Record<Tab, string> = {
   dashboard: "Dashboard", demand: "Demand Orders", inventory: "Inventory",
-  invoice: "Invoice Generator", invoices: "Invoice Records", barcode: "Barcode & Labels", gst: "GST / ITR Filing",
-  ppi: "Closed PPI Management", customers: "Customers", settings: "Settings", profile: "My Profile",
+  invoice: "Invoice Generator", invoices: "Invoice Records", reminders: "Bulk Payment Reminders",
+  ewb: "E-Way Bill Management", rates: "Party Wise Item Rate", bulk: "Bulk Item Update",
+  backup: "Data Backup", reports: "Business Reports", sync: "Data Sync Status",
+  barcode: "Barcode & Labels", ppi: "Closed PPI Management", gst: "GST / ITR Filing",
+  customers: "Customers", settings: "Settings", profile: "My Profile",
 };
 
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [profile, setProfile] = useLocalStorage<Profile>("billpro_profile", DEFAULT_PROFILE);
-  const [settings, setSettings] = useLocalStorage<AppSettings>("billpro_settings", DEFAULT_SETTINGS);
-  const [products, setProducts] = useLocalStorage<Product[]>("billpro_products", []);
-  const [customers, setCustomers] = useLocalStorage<Customer[]>("billpro_customers", []);
-  const [demands, setDemands] = useLocalStorage<DemandOrder[]>("billpro_demands", []);
-  const [invoices, setInvoices] = useLocalStorage<InvoiceRecord[]>("billpro_invoices", []);
-  const [ppiCards, setPpiCards] = useLocalStorage<PPICard[]>("billpro_ppi_cards", []);
+  const [accounts, setAccounts] = useLocalStorage<BusinessAccount[]>(ACCOUNT_INDEX_KEY, []);
+  const [activeBusinessId, setActiveBusinessId] = useLocalStorage<string>(ACTIVE_ACCOUNT_KEY, "");
+  const activeAccount = accounts.find((a) => a.id === activeBusinessId);
+  const storageKey = activeAccount?.storageKey || "billpro_no_active_account";
+  const scoped = (key: string) => scopedStorageKey(storageKey, key);
+  const [profile, setProfileBase] = useLocalStorage<Profile>(scoped("profile"), DEFAULT_PROFILE);
+  const [settings, setSettings] = useLocalStorage<AppSettings>(scoped("settings"), DEFAULT_SETTINGS);
+  const [products, setProducts] = useLocalStorage<Product[]>(scoped("products"), []);
+  const [customers, setCustomers] = useLocalStorage<Customer[]>(scoped("customers"), []);
+  const [demands, setDemands] = useLocalStorage<DemandOrder[]>(scoped("demands"), []);
+  const [invoices, setInvoices] = useLocalStorage<InvoiceRecord[]>(scoped("invoices"), []);
+  const [paymentReminders, setPaymentReminders] = useLocalStorage<PaymentReminder[]>(scoped("payment_reminders"), []);
+  const [eWayBills, setEWayBills] = useLocalStorage<EWayBill[]>(scoped("eway_bills"), []);
+  const [rateRules, setRateRules] = useLocalStorage<RateRule[]>(scoped("rate_rules"), []);
+  const [backups, setBackups] = useLocalStorage<BackupRecord[]>(scoped("backups"), []);
+  const [reports, setReports] = useLocalStorage<BusinessReport[]>(scoped("reports"), []);
+  const [syncJobs, setSyncJobs] = useLocalStorage<SyncJob[]>(scoped("sync_jobs"), []);
+  const [ppiCards, setPpiCards] = useLocalStorage<PPICard[]>(scoped("ppi_cards"), []);
+  const [activeUser, setActiveUser] = useLocalStorage<UserAccount | null>(scoped("active_user"), null);
+  const [sessionUser, setSessionUser] = useState<AuthSessionUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
   const [tab, setTab] = useState<Tab>("dashboard");
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  if (!profile.shopName) {
-    return <SetupScreen onComplete={(p) => setProfile(p)} />;
+  const handleAuthSuccess = (user: AuthSessionUser) => {
+    setSessionUser(user);
+  };
+
+  useEffect(() => {
+    const loadSession = async () => {
+      try {
+        const response = await fetch("/api/auth/me", { credentials: "include" });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (data?.user) {
+          setSessionUser(data.user);
+        }
+      } catch {
+        // ignore session fetch errors
+      } finally {
+        setAuthChecked(true);
+      }
+    };
+    loadSession();
+  }, []);
+
+  useEffect(() => {
+    if (!sessionUser) return;
+    const id = `CLOUD-${sessionUser.username.trim().toUpperCase()}`;
+    const accountKeyId = accountKey(id);
+    const businessAccount: BusinessAccount = {
+      id,
+      businessName: sessionUser.shopName,
+      ownerName: sessionUser.username,
+      mobile: normalizeMobile(sessionUser.phone),
+      storageKey: accountKeyId,
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    };
+
+    setAccounts((prev) => {
+      const exists = prev.some((item) => item.id === id);
+      if (exists) {
+        return prev.map((item) => item.id === id ? { ...item, lastActiveAt: new Date().toISOString() } : item);
+      }
+      return [businessAccount, ...prev];
+    });
+    setActiveBusinessId(id);
+    setProfileBase({
+      businessId: id,
+      shopName: sessionUser.shopName,
+      ownerName: sessionUser.username,
+      phone: normalizeMobile(sessionUser.phone),
+      email: "",
+      address: "",
+      gst: "",
+      pan: "",
+      category: "Other",
+      established: String(new Date().getFullYear()),
+    });
+    setActiveUser({
+      id: 0,
+      name: sessionUser.username,
+      role: "admin",
+      phone: normalizeMobile(sessionUser.phone),
+      email: "",
+      active: true,
+    });
+  }, [sessionUser, setActiveBusinessId, setActiveUser, setAccounts, setProfileBase]);
+
+  const handleLogout = async () => {
+    try {
+      await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
+    } catch {
+      // ignore logout network failures
+    }
+    setSessionUser(null);
+    setActiveBusinessId("");
+    window.location.reload();
+  };
+
+  const activateAccount = (account: BusinessAccount) => {
+    setAccounts((prev) => prev.map((a) => a.id === account.id ? { ...a, lastActiveAt: new Date().toISOString() } : a));
+    setActiveBusinessId(account.id);
+    window.location.reload();
+  };
+
+  const registerAccount = (form: Profile) => {
+    const mobile = normalizeMobile(form.phone);
+    const existingByMobile = accounts.find((a) => a.mobile === mobile);
+    if (existingByMobile && window.confirm(`This mobile number already belongs to ${existingByMobile.businessName}. Activate that account instead?`)) {
+      activateAccount(existingByMobile);
+      return;
+    }
+    const id = makeBusinessId(form.shopName, mobile, accounts);
+    const nextAccount: BusinessAccount = {
+      id,
+      businessName: form.shopName.trim(),
+      ownerName: form.ownerName.trim(),
+      mobile,
+      storageKey: accountKey(id),
+      createdAt: new Date().toISOString(),
+      lastActiveAt: new Date().toISOString(),
+    };
+    const nextProfile = { ...form, businessId: id, phone: mobile };
+    writeStored(scopedStorageKey(nextAccount.storageKey, "profile"), nextProfile);
+    writeStored(scopedStorageKey(nextAccount.storageKey, "settings"), DEFAULT_SETTINGS);
+    setAccounts((prev) => [nextAccount, ...prev]);
+    setActiveBusinessId(id);
+    window.location.reload();
+  };
+
+  const setProfile = (value: Profile | ((p: Profile) => Profile)) => {
+    setProfileBase((prev) => {
+      const next = value instanceof Function ? value(prev) : value;
+      if (activeAccount) {
+        setAccounts((all) => all.map((a) => a.id === activeAccount.id ? {
+          ...a,
+          businessName: next.shopName.trim() || a.businessName,
+          ownerName: next.ownerName.trim() || a.ownerName,
+          mobile: normalizeMobile(next.phone) || a.mobile,
+          lastActiveAt: new Date().toISOString(),
+        } : a));
+      }
+      return { ...next, businessId: activeAccount?.id || next.businessId };
+    });
+  };
+
+  useEffect(() => {
+    if (accounts.length) return;
+    const legacyProfile = readStored<Profile>("billpro_profile", DEFAULT_PROFILE);
+    if (legacyProfile.shopName && legacyProfile.phone) {
+      const mobile = normalizeMobile(legacyProfile.phone);
+      const id = legacyProfile.businessId || makeBusinessId(legacyProfile.shopName, mobile, []);
+      const migratedAccount: BusinessAccount = {
+        id,
+        businessName: legacyProfile.shopName,
+        ownerName: legacyProfile.ownerName,
+        mobile,
+        storageKey: accountKey(id),
+        createdAt: new Date().toISOString(),
+        lastActiveAt: new Date().toISOString(),
+      };
+      migrateLegacyData(migratedAccount.storageKey);
+      writeStored(scopedStorageKey(migratedAccount.storageKey, "profile"), { ...legacyProfile, businessId: id, phone: mobile });
+      setAccounts([migratedAccount]);
+      setActiveBusinessId(id);
+      window.location.reload();
+    }
+  }, [accounts.length]);
+
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen bg-[#0f2557] flex items-center justify-center text-white text-lg">Loading authentication...</div>
+    );
+  }
+
+  if (!sessionUser) {
+    return <AuthScreen onAuthSuccess={handleAuthSuccess} />;
+  }
+
+  if (!activeAccount || !profile.shopName) {
+    return <AccountAccessScreen accounts={accounts} onRegister={registerAccount} onActivate={activateAccount} />;
   }
 
   const handleNav = (t: Tab) => { setTab(t); setSidebarOpen(false); };
@@ -2445,11 +2770,10 @@ export default function App() {
             <IndianRupee className="w-4 h-4 text-white" />
           </div>
           <div>
-            <p className="font-bold text-white text-sm leading-tight">BillPro</p>
+            <p className="font-bold text-white text-sm leading-tight">Bill Pilot</p>
             <p className="text-[10px] text-blue-300/70">Business Suite</p>
           </div>
         </div>
-
         <nav className="flex-1 py-3 space-y-0.5 overflow-y-auto px-2">
           {NAV.map(({ id, label, icon: Icon }) => (
             <button key={id} onClick={() => handleNav(id)}
@@ -2468,7 +2792,7 @@ export default function App() {
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-xs font-semibold text-white truncate">{profile.ownerName || profile.shopName}</p>
-              <p className="text-[10px] text-blue-300/60 truncate">{profile.shopName}</p>
+              <p className="text-[10px] text-blue-300/60 truncate">{profile.businessId || profile.shopName}</p>
             </div>
           </div>
         </div>
@@ -2483,7 +2807,13 @@ export default function App() {
           <div className="ml-auto flex items-center gap-2">
             <div className="hidden sm:block text-xs text-right text-muted-foreground">
               <p className="font-medium text-foreground">{profile.shopName}</p>
+              <p className="font-[DM_Mono]">{profile.businessId}</p>
             </div>
+            <button onClick={handleLogout}
+              title="Sign out"
+              className="w-8 h-8 rounded-full border border-border flex items-center justify-center text-muted-foreground hover:bg-muted transition-colors">
+              <LogOut className="w-4 h-4" />
+            </button>
             <button onClick={() => handleNav("profile")}
               className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-sm font-bold cursor-pointer hover:bg-primary/90 transition-colors">
               {profile.shopName.charAt(0).toUpperCase()}
