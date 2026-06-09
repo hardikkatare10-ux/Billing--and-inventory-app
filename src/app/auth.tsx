@@ -56,7 +56,7 @@ async function postJson(path: string, body: Record<string, unknown>) {
   return data;
 }
 
-const isValidPassword = (value: string) => /^682\d+$/.test(value);
+const isValidPassword = (value: string) => typeof value === "string" && value.trim().length > 0;
 
 export default function AuthScreen({ onAuthSuccess }: { onAuthSuccess: (user: AuthSessionUser) => void }) {
   const [mode, setMode] = useState<AuthMode>("login");
@@ -111,7 +111,7 @@ export default function AuthScreen({ onAuthSuccess }: { onAuthSuccess: (user: Au
       return;
     }
     if (!isValidPassword(form.password)) {
-      setError("Password must start with 682 and contain only digits.");
+      setError("Password cannot be empty.");
       return;
     }
     if (form.password !== form.confirmPassword) {
@@ -141,7 +141,7 @@ export default function AuthScreen({ onAuthSuccess }: { onAuthSuccess: (user: Au
       return;
     }
     if (!isValidPassword(form.newPassword)) {
-      setError("New password must start with 682 and contain only digits.");
+      setError("New password cannot be empty.");
       return;
     }
     if (form.newPassword !== form.confirmPassword) {
