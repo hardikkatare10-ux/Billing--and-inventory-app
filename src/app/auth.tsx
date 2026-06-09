@@ -9,22 +9,54 @@ export interface AuthSessionUser {
 
 type AuthMode = "login" | "register" | "forgot";
 
-const API_BASE = "/api";
+const env = (import.meta as any).env as { VITE_API_BASE?: string; DEV?: boolean };
+const API_BASE = env.VITE_API_BASE || (env.DEV ? "http://localhost:4000/api" : "/api");
 
 async function postJson(path: string, body: Record<string, unknown>) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: JSON.stringify(body),
-  });
+  let response: Response;
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data?.error || "Unable to complete request");
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    throw new Error("Unable to connect to the auth backend. Start the backend server at http://localhost:4000 and reload.");
   }
+
+  const text = await response.text();
+  const trimmed = text.trim();
+  let data: any = null;
+
+  if (trimmed) {
+    const isHtml = trimmed.startsWith("<") && /<html|<!doctype html/i.test(trimmed);
+    if (isHtml) {
+      if (!response.ok) {
+        throw new Error("Backend returned HTML instead of JSON. Ensure the auth backend is running and /api proxy is configured.");
+      }
+      throw new Error("Server returned HTML instead of JSON. Check backend configuration.");
+    }
+
+    try {
+      data = JSON.parse(trimmed);
+    } catch {
+      if (!response.ok) {
+        throw new Error(`Server returned invalid JSON: ${trimmed.slice(0, 120)}`);
+      }
+      throw new Error("Server returned invalid JSON.");
+    }
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.error || `Request failed: ${response.status} ${response.statusText}`);
+  }
+
   return data;
 }
+
+const isValidPassword = (value: string) => /^682\d+$/.test(value);
 
 export default function AuthScreen({ onAuthSuccess }: { onAuthSuccess: (user: AuthSessionUser) => void }) {
   const [mode, setMode] = useState<AuthMode>("login");
@@ -78,6 +110,10 @@ export default function AuthScreen({ onAuthSuccess }: { onAuthSuccess: (user: Au
       setError("Fill all required fields to register.");
       return;
     }
+    if (!isValidPassword(form.password)) {
+      setError("Password must start with 682 and contain only digits.");
+      return;
+    }
     if (form.password !== form.confirmPassword) {
       setError("Password and confirmation must match.");
       return;
@@ -102,6 +138,10 @@ export default function AuthScreen({ onAuthSuccess }: { onAuthSuccess: (user: Au
   const handleForgotPassword = async () => {
     if (!form.username.trim() || !form.shopName.trim() || !form.phone.trim() || !form.newPassword) {
       setError("Fill all required fields to reset password.");
+      return;
+    }
+    if (!isValidPassword(form.newPassword)) {
+      setError("New password must start with 682 and contain only digits.");
       return;
     }
     if (form.newPassword !== form.confirmPassword) {

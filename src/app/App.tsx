@@ -18,6 +18,9 @@ import {
   Tooltip, ResponsiveContainer, PieChart, Pie, Cell
 } from "recharts";
 
+const env = (import.meta as any).env as { VITE_API_BASE?: string; DEV?: boolean };
+const API_BASE = env.VITE_API_BASE || (env.DEV ? "http://localhost:4000/api" : "/api");
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 interface Profile {
   businessId: string; shopName: string; ownerName: string; phone: string; email: string;
@@ -2575,7 +2578,7 @@ export default function App() {
   useEffect(() => {
     const loadSession = async () => {
       try {
-        const response = await fetch("/api/auth/me", { credentials: "include" });
+        const response = await fetch(`${API_BASE}/auth/me`, { credentials: "include" });
         if (!response.ok) return;
         const data = await response.json();
         if (data?.user) {
@@ -2636,7 +2639,7 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
+      await fetch(`${API_BASE}/auth/logout`, { method: "POST", credentials: "include" });
     } catch {
       // ignore logout network failures
     }
