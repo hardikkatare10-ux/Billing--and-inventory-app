@@ -41,7 +41,7 @@ app.use(session({
 
 const normalizePhone = (value) => value?.toString().replace(/\D/g, "").slice(-10);
 const getUserByUsername = (username) => db.data.users.find((user) => user.username === username);
-const isValidPassword = (value) => typeof value === "string" && /^682\d+$/.test(value);
+const isValidPassword = (value) => typeof value === "string" && value.trim().length > 0;
 
 app.get("/api/auth/me", async (req, res) => {
   const userId = req.session?.userId;
@@ -64,7 +64,7 @@ app.post("/api/auth/register", async (req, res) => {
     return res.status(400).json({ error: "All registration fields are required." });
   }
   if (!isValidPassword(password)) {
-    return res.status(400).json({ error: "Password must start with 682 and contain only digits." });
+    return res.status(400).json({ error: "Password cannot be empty." });
   }
 
   const normalizedUsername = username.trim().toLowerCase();
@@ -120,7 +120,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     return res.status(400).json({ error: "All fields are required to reset the password." });
   }
   if (!isValidPassword(newPassword)) {
-    return res.status(400).json({ error: "New password must start with 682 and contain only digits." });
+    return res.status(400).json({ error: "New password cannot be empty." });
   }
 
   const normalizedUsername = username.trim().toLowerCase();
