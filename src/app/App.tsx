@@ -9,7 +9,8 @@ import {
   ExternalLink, CheckCircle2, XCircle, Sparkles, Boxes,
   Tag, ChevronRight, Eye, Star, RotateCcw, LogOut,
   Globe, Copy, Store, ChevronDown,
-  Wallet, CreditCard, Gift, Award, Download
+  Wallet, CreditCard, Gift, Award, Download,
+  HardDrive
 } from "lucide-react";
 import { extractInvoiceFromFile, InvoiceExtractionResult } from "./invoiceParser";
 import {
