@@ -10,10 +10,17 @@ import fs from "fs";
 
 dotenv.config();
 
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
+
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const SESSION_SECRET = process.env.SESSION_SECRET || "replace-this-session-secret";
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
+const CLIENT_ORIGINS = (process.env.CLIENT_ORIGIN || "http://localhost:5173").split(",").map((origin) => origin.trim()).filter(Boolean);
 
 const dbFile = path.resolve(process.cwd(), "server", "data.json");
 if (!fs.existsSync(dbFile)) {
@@ -25,7 +32,18 @@ const adapter = new JSONFile(dbFile);
 const db = new Low(adapter, { users: [] });
 await db.read();
 
-app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }));
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) {
+      return callback(null, true);
+    }
+    if (CLIENT_ORIGINS.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error(`CORS origin denied: ${origin}`));
+  },
+  credentials: true,
+}));
 app.use(express.json());
 app.use(session({
   secret: SESSION_SECRET,
@@ -59,86 +77,101 @@ app.get("/api/auth/me", async (req, res) => {
 });
 
 app.post("/api/auth/register", async (req, res) => {
-  const { username, shopName, phone, password } = req.body;
-  if (!username || !shopName || !phone || !password) {
-    return res.status(400).json({ error: "All registration fields are required." });
+  try {
+    const { username, shopName, phone, password } = req.body;
+    if (!username || !shopName || !phone || !password) {
+      return res.status(400).json({ error: "All registration fields are required." });
+    }
+    if (!isValidPassword(password)) {
+      return res.status(400).json({ error: "Password cannot be empty." });
+    }
+
+    const normalizedUsername = username.trim().toLowerCase();
+    const normalizedPhone = normalizePhone(phone);
+    await db.read();
+
+    if (getUserByUsername(normalizedUsername)) {
+      return res.status(409).json({ error: "Username is already in use." });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const user = {
+      id: `${normalizedUsername}-${Date.now()}`,
+      username: normalizedUsername,
+      shopName: shopName.trim(),
+      phone: normalizedPhone,
+      passwordHash,
+      createdAt: new Date().toISOString(),
+    };
+
+    db.data.users.push(user);
+    await db.write();
+
+    req.session.userId = user.id;
+    return res.status(201).json({ user: { username: user.username, shopName: user.shopName, phone: user.phone } });
+  } catch (err) {
+    console.error('Register handler error:', err && err.stack ? err.stack : err, 'body:', req.body);
+    return res.status(500).json({ error: 'Internal server error.' });
   }
-  if (!isValidPassword(password)) {
-    return res.status(400).json({ error: "Password cannot be empty." });
-  }
-
-  const normalizedUsername = username.trim().toLowerCase();
-  const normalizedPhone = normalizePhone(phone);
-  await db.read();
-
-  if (getUserByUsername(normalizedUsername)) {
-    return res.status(409).json({ error: "Username is already in use." });
-  }
-
-  const passwordHash = await bcrypt.hash(password, 12);
-  const user = {
-    id: `${normalizedUsername}-${Date.now()}`,
-    username: normalizedUsername,
-    shopName: shopName.trim(),
-    phone: normalizedPhone,
-    passwordHash,
-    createdAt: new Date().toISOString(),
-  };
-
-  db.data.users.push(user);
-  await db.write();
-
-  req.session.userId = user.id;
-  return res.status(201).json({ user: { username: user.username, shopName: user.shopName, phone: user.phone } });
 });
 
 app.post("/api/auth/login", async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) {
-    return res.status(400).json({ error: "Username and password are required." });
-  }
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: "Username and password are required." });
+    }
 
-  const normalizedUsername = username.trim().toLowerCase();
-  await db.read();
-  const user = getUserByUsername(normalizedUsername);
-  if (!user) {
-    return res.status(401).json({ error: "Invalid username or password." });
-  }
+    const normalizedUsername = username.trim().toLowerCase();
+    await db.read();
+    const user = getUserByUsername(normalizedUsername);
+    if (!user) {
+      return res.status(401).json({ error: "Invalid username or password." });
+    }
 
-  const match = await bcrypt.compare(password, user.passwordHash);
-  if (!match) {
-    return res.status(401).json({ error: "Invalid username or password." });
-  }
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      return res.status(401).json({ error: "Invalid username or password." });
+    }
 
-  req.session.userId = user.id;
-  return res.status(200).json({ user: { username: user.username, shopName: user.shopName, phone: user.phone } });
+    req.session.userId = user.id;
+    return res.status(200).json({ user: { username: user.username, shopName: user.shopName, phone: user.phone } });
+  } catch (err) {
+    console.error('Login handler error:', err && err.stack ? err.stack : err, 'body:', req.body);
+    return res.status(500).json({ error: 'Internal server error.' });
+  }
 });
 
 app.post("/api/auth/forgot-password", async (req, res) => {
-  const { username, shopName, phone, newPassword } = req.body;
-  if (!username || !shopName || !phone || !newPassword) {
-    return res.status(400).json({ error: "All fields are required to reset the password." });
+  try {
+    const { username, shopName, phone, newPassword } = req.body;
+    if (!username || !shopName || !phone || !newPassword) {
+      return res.status(400).json({ error: "All fields are required to reset the password." });
+    }
+    if (!isValidPassword(newPassword)) {
+      return res.status(400).json({ error: "New password cannot be empty." });
+    }
+
+    const normalizedUsername = username.trim().toLowerCase();
+    const normalizedPhone = normalizePhone(phone);
+    await db.read();
+
+    const user = db.data.users.find(
+      (item) => item.username === normalizedUsername && item.shopName === shopName.trim() && item.phone === normalizedPhone
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: "No account matches the provided information." });
+    }
+
+    user.passwordHash = await bcrypt.hash(newPassword, 12);
+    await db.write();
+
+    return res.status(200).json({ message: "Password reset completed successfully." });
+  } catch (err) {
+    console.error('Forgot-password handler error:', err && err.stack ? err.stack : err, 'body:', req.body);
+    return res.status(500).json({ error: 'Internal server error.' });
   }
-  if (!isValidPassword(newPassword)) {
-    return res.status(400).json({ error: "New password cannot be empty." });
-  }
-
-  const normalizedUsername = username.trim().toLowerCase();
-  const normalizedPhone = normalizePhone(phone);
-  await db.read();
-
-  const user = db.data.users.find(
-    (item) => item.username === normalizedUsername && item.shopName === shopName.trim() && item.phone === normalizedPhone
-  );
-
-  if (!user) {
-    return res.status(404).json({ error: "No account matches the provided information." });
-  }
-
-  user.passwordHash = await bcrypt.hash(newPassword, 12);
-  await db.write();
-
-  return res.status(200).json({ message: "Password reset completed successfully." });
 });
 
 app.post("/api/auth/logout", (req, res) => {
